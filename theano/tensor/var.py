@@ -160,7 +160,7 @@ class _tensor_py_operators(object):
         # See explanation in __add__ for the error catched
         # and the return value in that case
         try:
-            return theano.tensor.dot(self, other)
+            return theano.tensor.matmul(self, other)
         except (NotImplementedError, AsTensorError):
             return NotImplemented
 
@@ -246,7 +246,7 @@ class _tensor_py_operators(object):
         return theano.tensor.basic.sub(other, self)
 
     def __rmatmul__(self, other):
-        return theano.tensor.basic.dot(other, self)
+        return theano.tensor.basic.matmul(other, self)
 
     def __rmul__(self, other):
         return theano.tensor.basic.mul(other, self)
