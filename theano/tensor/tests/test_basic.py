@@ -31,9 +31,9 @@ from theano.tensor import (_shared, wvector, bvector, autocast_float_as,
         horizontal_stack, vertical_stack, argmax, get_vector_length,
         fscalar, zeros_like, sum, tensor3, vector, add, addbroadcast,
         alloc, as_tensor_variable, tensor_from_scalar, ARange, autocast_float,
-        clip, constant, default, dot, batched_dot,
-        dmatrix, dscalar, dvector, eq, eye, fill, flatten, inverse_permutation,
-        tensor4, permute_row_elements, Flatten, fmatrix, fscalars, grad,
+        clip, constant, default, dot, matmul, batched_dot,
+        dmatrix, dscalar, dvector, eq, eye, fill, flatten, inverse_permutation, Flatten,
+        tensor4, permute_row_elements, fmatrix, fscalars, grad,
         inplace, iscalar, matrix, minimum, matrices, maximum, mul, neq,
         Reshape, row, scalar, scalars, second, smallest, stack, sub, Tensor,
         tensor_copy, tensordot, TensorType, Tri, tri, tril, triu, unbroadcast,
@@ -1954,6 +1954,29 @@ ConjInplaceTester = makeBroadcastTester(
     expected=numpy.conj,
     good=_good_broadcast_unary_normal,
     inplace=True)
+
+
+MatmulTester = makeTester(name='MatmulTester',
+                       op=matmul,
+                       expected=lambda x, y: numpy.matmul(x, y),
+                       checks={},
+                       good=dict(correct4x4_1=(rand(2, 5, 5, 7), rand(2, 5, 7, 5)),
+                                 correct4x4_2=(rand(2, 5, 5, 7), rand(2, 5, 7, 9)),
+                                 correct3x3_1=(rand(5, 5, 7), rand(5, 7, 5)),
+                                 correct3x3_2=(rand(5, 5, 7), rand(5, 7, 9)),
+                                 correct2x2_1=(rand(5, 7), rand(7, 5)),
+                                 correct2x2_2=(rand(5, 7), rand(7, 9)),
+                                 correct2x1=(rand(5, 7), rand(7)),
+                                 correct1x2=(rand(5), rand(5, 7))
+                                 ),
+                       bad_build=dict(badscalar=(1, rand(2, 2)),
+                                      baddim3x4=(rand(2, 5, 7, 5), rand(5, 7, 5)),
+                                      ),
+                       bad_runtime=dict(bad2x2_1=(rand(5, 7), rand(5, 7)),
+                                        bad2x2_2=(rand(5, 7), rand(8, 3)),
+                                        bad3x3_1=(rand(5, 5, 7), rand(5, 8, 3)),
+                                        bad4x4_1=(rand(2, 5, 5, 7), rand(2, 5, 8, 3)),
+                                        bad4x4_2=(rand(3, 5, 5, 7), rand(2, 5, 7, 9))))
 
 
 DotTester = makeTester(name='DotTester',
