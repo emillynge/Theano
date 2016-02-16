@@ -7,16 +7,17 @@ from theano import Apply, tensor, config, Variable
 from theano.scalar import as_scalar, constant, Log
 from theano.gradient import DisconnectedType, grad_not_implemented
 from theano.gof import Optimizer, local_optimizer, COp
-from theano.gof.type import CDataType, Generic
+from theano.gof.type import CDataType
 from theano.compile import optdb
 from theano.compile.ops import shape_i
-from theano.tensor.nnet import SoftmaxGrad
+from theano.tensor.nnet import LogSoftmax, SoftmaxGrad
 from theano.tensor.nnet.abstract_conv import get_conv_output_shape
-from theano.tensor.signal.downsample import (
-    DownsampleFactorMax, MaxPoolGrad, AveragePoolGrad)
+from theano.tensor.signal.pool import (
+    Pool, MaxPoolGrad, AveragePoolGrad)
 from theano.sandbox.cuda.type import CudaNdarrayType
 
-from theano.sandbox.cuda import GpuOp
+from theano.sandbox.cuda import GpuOp, dnn_available
+from theano.sandbox.cuda import dnn_version as version
 from theano.sandbox.cuda.basic_ops import (as_cuda_ndarray_variable,
                                            host_from_gpu,
                                            gpu_contiguous, HostFromGpu,
@@ -33,93 +34,6 @@ from theano.sandbox.cuda.nvcc_compiler import NVCC_compiler
 from theano.tensor.nnet.abstract_conv import (AbstractConv2d,
                                               AbstractConv2d_gradWeights,
                                               AbstractConv2d_gradInputs)
-
-
-def dnn_available():
-    if dnn_available.avail is None:
-        if not theano.sandbox.cuda.cuda_available:
-            dnn_available.msg = "CUDA not available"
-            dnn_available.avail = False
-            return False
-        dev = theano.sandbox.cuda.active_device_number()
-        if theano.sandbox.cuda.device_properties(dev)['major'] < 3:
-            dnn_available.msg = "Device not supported by cuDNN"
-            dnn_available.avail = False
-        else:
-            preambule = """
-#include <stdio.h>
-#include <cuda.h>
-#include <cudnn.h>
-#include <cudnn_helper.h>
-            """
-
-            body = """
-cudnnHandle_t _handle = NULL;
-cudnnStatus_t err;
-if ((err = cudnnCreate(&_handle)) != CUDNN_STATUS_SUCCESS) {
-  fprintf(stderr, "could not create cuDNN handle: %s",
-          cudnnGetErrorString(err));
-  return 1;
-}
-"""
-            params = ["-l", "cudnn", "-I" + os.path.dirname(__file__)]
-            if config.dnn.include_path:
-                params.append("-I" + config.dnn.include_path)
-            if config.dnn.library_path:
-                params.append("-L" + config.dnn.library_path)
-            if config.nvcc.compiler_bindir:
-                params.extend(['--compiler-bindir',
-                               config.nvcc.compiler_bindir])
-            # Do not run here the test program. It would run on the
-            # default gpu, not the one selected by the user. If mixed
-            # GPU are installed or if the GPUs are configured in
-            # exclusive mode, this cause bad detection.
-            comp, out, err = NVCC_compiler.try_flags(
-                flag_list=params, preambule=preambule, body=body,
-                try_run=False, output=True)
-
-            dnn_available.avail = comp
-            if not dnn_available.avail:
-                dnn_available.msg = (
-                    "Theano can not compile with cuDNN. We got this error:\n" +
-                    str(err))
-            else:
-                # If we can compile, check that we can import and run.
-                v = version()
-                if isinstance(v, tuple) and v[0] != v[1]:
-                    dnn_available.avail = False
-                    dnn_available.msg = ("Mixed dnn version. The header is"
-                                         " from one version, but we link with"
-                                         " a different version %s" % str(v))
-                    raise RuntimeError(dnn_available.msg)
-                if v == -1:
-                    dnn_available.avail = False
-                    dnn_available.msg = (
-                        "CuDNN v1 detected. This version is no longer "
-                        "supported by Theano. Update your CuDNN installation "
-                        "to a more recent version")
-                    raise RuntimeError(dnn_available.msg)
-                if v == (20, 20):
-                    dnn_available.avail = False
-                    dnn_available.msg = (
-                        "You have installed a release candidate of CuDNN v2."
-                        " This isn't supported anymore."
-                        " Update to CuDNN v2 final version.")
-                    raise RuntimeError(dnn_available.msg)
-                if 3000 <= v[0] < 3007:
-                    # 3007 is the final release of cudnn v3
-                    dnn_available.avail = False
-                    dnn_available.msg = (
-                        "You have installed a release candidate of CuDNN v3."
-                        " This isn't supported anymore."
-                        " Update to CuDNN v3 final version.")
-                    raise RuntimeError(dnn_available.msg)
-
-    return dnn_available.avail
-
-
-dnn_available.avail = None
-dnn_available.msg = None
 
 
 def c_set_tensor4d(var, desc, err, fail):
@@ -178,67 +92,6 @@ class DnnBase(GpuOp, COp):
         return ['cudnn']
 
 
-class DnnVersion(GpuOp):
-    def c_compiler(self):
-        return NVCC_compiler
-
-    def c_headers(self):
-        return ['cudnn.h']
-
-    def c_libraries(self):
-        return ['cudnn']
-
-    def c_support_code(self):
-        return """
-#if PY_MAJOR_VERSION >= 3
-#define PyInt_FromLong PyLong_FromLong
-#endif
-"""
-
-    def make_node(self):
-        return Apply(self, [], [Generic()()])
-
-    def c_code(self, node, name, inputs, outputs, sub):
-        o = outputs[0]
-        return """
-        #if defined(CUDNN_VERSION)
-        %(o)s = PyTuple_Pack(2, PyInt_FromLong(CUDNN_VERSION), PyInt_FromLong(cudnnGetVersion()));
-        #else
-        %(o)s = PyInt_FromLong(-1);
-        #endif
-        """ % locals()
-
-    def do_constant_folding(self, node):
-        # Needed as we do not want to cache this information.
-        return False
-
-    def c_code_cache_version(self):
-        # Not needed, but make it clear that we do not want to cache this.
-        return None
-
-
-def version():
-    """Return the current cuDNN version we compile with.
-
-    This returns a tuple with the header version and the library
-    version we link with. For older cudnn version without version
-    information, we return -1.
-
-    """
-    if not dnn_available():
-        raise Exception(
-            "We can't determine the cudnn version as it is not available",
-            dnn_available.msg)
-
-    if version.v is None:
-        f = theano.function([], DnnVersion()(),
-                            theano.Mode(optimizer=None),
-                            profile=False)
-        version.v = f()
-    return version.v
-version.v = None
-
-
 class GpuDnnConvDesc(GpuOp):
     """
     This Op builds a convolution descriptor for use in the other
@@ -248,7 +101,7 @@ class GpuDnnConvDesc(GpuOp):
 
     """
 
-    __props__ = ('border_mode', 'subsample', 'conv_mode')
+    __props__ = ('border_mode', 'subsample', 'conv_mode', 'precision')
 
     def c_headers(self):
         return ['cudnn.h', 'cudnn_helper.h']
@@ -265,23 +118,27 @@ class GpuDnnConvDesc(GpuOp):
     def do_constant_folding(self, node):
         return False
 
-    def __init__(self, border_mode, subsample=(1, 1), conv_mode='conv'):
+    def __init__(self, border_mode, subsample=(1, 1), conv_mode='conv',
+                 precision="float32"):
         if isinstance(border_mode, int):
             border_mode = (border_mode,) * len(subsample)
         if isinstance(border_mode, tuple):
             assert len(border_mode) == len(subsample)
             border_mode = tuple(map(int, border_mode))
         if not ((isinstance(border_mode, tuple) and min(border_mode) >= 0) or
-                border_mode in ('valid', 'full')):
+                border_mode in ('valid', 'full', 'half')):
             raise ValueError(
                 'invalid border_mode {}, which must be either '
-                '"valid", "full", an integer or a pair of'
+                '"valid", "full", "half", an integer or a pair of'
                 ' integers'.format(border_mode))
         self.border_mode = border_mode
         assert len(subsample) in [2, 3]
         self.subsample = subsample
         assert conv_mode in ('conv', 'cross')
         self.conv_mode = conv_mode
+
+        assert precision in ['float16', 'float32', 'float64']
+        self.precision = precision
 
     def make_node(self, img_shape, kern_shape):
         if img_shape.type.ndim != 1 or img_shape.type.dtype != 'int64':
@@ -302,12 +159,14 @@ class GpuDnnConvDesc(GpuOp):
         if isinstance(self.border_mode, tuple):
             pad_desc = tuple(map(int, self.border_mode))
             assert min(pad_desc) >= 0
-            bmode = 2
+            bmode = 1
         else:
             pad_desc = [0] * nb_dim
 
             if self.border_mode == "valid":
                 bmode = 1
+            elif self.border_mode == "half":
+                bmode = 2
             else:
                 assert self.border_mode == "full"
                 bmode = 0
@@ -320,6 +179,14 @@ class GpuDnnConvDesc(GpuOp):
         pad_str = ", ".join([str(s) for s in pad_desc])
         subsample_str = ", ".join([str(s) for s in self.subsample])
         upscale_str = ", ".join(["1"] * nb_dim)
+
+        if self.precision == 'float16':
+            precision = 'CUDNN_DATA_HALF'
+        elif self.precision == 'float32':
+            precision = 'CUDNN_DATA_FLOAT'
+        else:
+            assert self.precision == 'float64'
+            precision = 'CUDNN_DATA_DOUBLE'
 
         return """
 {
@@ -345,12 +212,20 @@ class GpuDnnConvDesc(GpuOp):
         pad[2] = *(npy_int64 *)PyArray_GETPTR1(%(kern_shape)s, 4) - 1;
     }
   }
+  // Adjust padding values if using half convolution
+  else if (%(bmode)d == 2) {
+    pad[0] = *(npy_int64 *)PyArray_GETPTR1(%(kern_shape)s, 2) / 2;
+    pad[1] = *(npy_int64 *)PyArray_GETPTR1(%(kern_shape)s, 3) / 2;
+    if (%(nb_dim)d >= 3) {
+        pad[2] = *(npy_int64 *)PyArray_GETPTR1(%(kern_shape)s, 4) / 2;
+    }
+  }
 
-  err = cudnnSetConvolutionNdDescriptor(
+  err = cudnnSetConvolutionNdDescriptor_v3(
   %(desc)s,
   %(nb_dim)d,
   pad, subsample, upscale,
-  %(conv_flag)s
+  %(conv_flag)s, %(precision)s
   );
 #else
   PyErr_Format(PyExc_RuntimeError, "could not set op descriptor: CUDNN_VERSION must be >= 30");
@@ -364,10 +239,10 @@ class GpuDnnConvDesc(GpuOp):
 """ % dict(name=name, img_shape=img_shape, kern_shape=kern_shape, desc=desc,
            bmode=bmode, conv_flag=conv_flag, fail=sub['fail'],
            pad_str=pad_str, subsample_str=subsample_str,
-           upscale_str=upscale_str, nb_dim=nb_dim)
+           upscale_str=upscale_str, nb_dim=nb_dim, precision=precision)
 
     def c_code_cache_version(self):
-        return (2, version())
+        return (4, version())
 
 # scalar constants
 _zero = constant(numpy.asarray(0.0, dtype='float32'))
@@ -401,9 +276,8 @@ class GpuDnnConv(DnnBase, COp):
     workmem
         *deprecated*, use parameter algo instead.
     algo
-        ['none', 'small', 'large', 'fft', 'guess_once',
-         'guess_on_shape_change', 'time_once',
-         'time_on_shape_change']
+        ['none', 'small', 'large', 'fft', 'fft_tiling', 'guess_once',
+         'guess_on_shape_change', 'time_once', 'time_on_shape_change']
 
         Default is the value of :attr:`config.dnn.conv.algo_fwd`.
 
@@ -445,9 +319,15 @@ class GpuDnnConv(DnnBase, COp):
                 raise RuntimeError("CuDNN convolution timing requires CuDNN "
                                    "v3")
 
-        assert self.algo in ['none', 'small', 'large', 'fft', 'guess_once',
-                             'guess_on_shape_change', 'time_once',
-                             'time_on_shape_change']
+        # The fft_tiling implementation is only available from CuDNN V4 onward
+        if version() < (4000, 4000):
+            if self.algo == 'fft_tiling':
+                raise RuntimeError("CuDNN tiled-FFT convolution requires "
+                                   "CuDNN v4 or more recent")
+
+        assert self.algo in ['none', 'small', 'large', 'fft', 'fft_tiling',
+                             'guess_once', 'guess_on_shape_change',
+                             'time_once', 'time_on_shape_change']
 
     def __setstate__(self, d):
         self.__dict__.update(d)
@@ -477,8 +357,15 @@ class GpuDnnConv(DnnBase, COp):
                 alg = 'CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM'
             elif self.algo == 'large':
                 alg = 'CUDNN_CONVOLUTION_FWD_ALGO_GEMM'
+            elif self.algo == 'direct':
+                # need v2
+                alg = 'CUDNN_CONVOLUTION_FWD_ALGO_DIRECT'
             elif self.algo == 'fft':
+                # need v3
                 alg = 'CUDNN_CONVOLUTION_FWD_ALGO_FFT'
+            elif self.algo == 'fft_tiling':
+                # need v4
+                alg = 'CUDNN_CONVOLUTION_FWD_ALGO_FFT_TILING'
             elif self.algo in ['guess_once', 'guess_on_shape_change']:
                 # The convolution implementation should be choosen according
                 # to a heuristic
@@ -652,8 +539,8 @@ class GpuDnnConvGradW(DnnBase, COp):
         The convolution descriptor.
     workmem
         *deprecated*, use parameter algo instead.
-    algo : {'none', 'deterministic', 'fft', 'guess_once', 'guess_on_shape_change', 'time_once', 'time_on_shape_change'}
-        Default is the value of :attr:`config.dnn.conv.algo_bwd`.
+    algo : {'none', 'deterministic', 'fft', 'small', 'guess_once', 'guess_on_shape_change', 'time_once', 'time_on_shape_change'}
+        Default is the value of :attr:`config.dnn.conv.algo_bwd_filter`.
 
     """
 
@@ -671,15 +558,16 @@ class GpuDnnConvGradW(DnnBase, COp):
             self.algo = workmem
         else:
             if algo is None:
-                algo = config.dnn.conv.algo_bwd
+                algo = config.dnn.conv.algo_bwd_filter
             self.algo = algo
 
         self.inplace = inplace
         if self.inplace:
             self.destroy_map = {0: [2]}
-        assert self.algo in ['none', 'deterministic', 'fft', 'guess_once',
-                             'guess_on_shape_change', 'time_once',
-                             'time_on_shape_change']
+
+        assert self.algo in ['none', 'deterministic', 'fft', 'small',
+                             'guess_once', 'guess_on_shape_change',
+                             'time_once', 'time_on_shape_change']
 
     def __setstate__(self, d):
         self.__dict__.update(d)
@@ -687,7 +575,7 @@ class GpuDnnConvGradW(DnnBase, COp):
             if hasattr(self, 'workmem'):
                 self.algo = self.workmem
             else:
-                self.algo = config.dnn.conv.algo_bwd
+                self.algo = config.dnn.conv.algo_bwd_filter
         if not hasattr(self, 'inplace'):
             self.inplace = False
 
@@ -724,11 +612,15 @@ class GpuDnnConvGradW(DnnBase, COp):
             alg = "0"
         else:
             if self.algo == 'none':
+                # non-deterministic
                 alg = 'CUDNN_CONVOLUTION_BWD_FILTER_ALGO_0'
             elif self.algo == 'deterministic':
                 alg = 'CUDNN_CONVOLUTION_BWD_FILTER_ALGO_1'
             elif self.algo == 'fft':
                 alg = 'CUDNN_CONVOLUTION_BWD_FILTER_ALGO_FFT'
+            elif self.algo == 'small':
+                # need v3, non-deterministic, small workspace
+                alg = 'CUDNN_CONVOLUTION_BWD_FILTER_ALGO_3'
             elif self.algo in ['guess_once', 'guess_on_shape_change']:
                 # The convolution implementation should be chosen according
                 # to a heuristic
@@ -788,7 +680,7 @@ class GpuDnnConv3dGradW(GpuDnnConvGradW):
     :param workmem:
         *deprecated*, use parameter algo instead.
     :param algo: ['none', 'guess_once', 'guess_on_shape_change', 'time_once', 'time_on_shape_change']
-        Default is the value of :attr:`config.dnn.conv.algo_bwd`.
+        Default is the value of :attr:`config.dnn.conv.algo_bwd_filter`.
 
     """
     __props__ = ('algo', 'inplace',)
@@ -856,11 +748,11 @@ class GpuDnnConvGradI(DnnBase, COp):
     workmem
         *deprecated*, use parameter algo instead.
     algo
-        ['none', 'deterministic', 'fft', 'guess_once',
+        ['none', 'deterministic', 'fft', 'fft_tiling', 'guess_once',
          'guess_on_shape_change', 'time_once',
          'time_on_shape_change']
 
-        Default is the value of :attr:`config.dnn.conv.algo_bwd`.
+        Default is the value of :attr:`config.dnn.conv.algo_bwd_data`.
 
     """
 
@@ -879,15 +771,23 @@ class GpuDnnConvGradI(DnnBase, COp):
             self.algo = workmem
         else:
             if algo is None:
-                algo = config.dnn.conv.algo_bwd
+                algo = config.dnn.conv.algo_bwd_data
             self.algo = algo
 
         self.inplace = inplace
         if self.inplace:
             self.destroy_map = {0: [2]}
-        assert self.algo in ['none', 'deterministic', 'fft', 'guess_once',
-                             'guess_on_shape_change', 'time_once',
-                             'time_on_shape_change']
+
+        # The small-workspace implementation is only available from CuDNN V4
+        # onward.
+        if version() < (4000, 4000):
+            if self.algo == 'fft_tiling':
+                raise RuntimeError("CuDNN's tiled-FFT convolution requires "
+                                   "CuDNN v4 or more recent")
+
+        assert self.algo in ['none', 'deterministic', 'fft', 'fft_tiling',
+                             'guess_once', 'guess_on_shape_change',
+                             'time_once', 'time_on_shape_change']
 
     def __setstate__(self, d):
         self.__dict__.update(d)
@@ -895,7 +795,7 @@ class GpuDnnConvGradI(DnnBase, COp):
             if hasattr(self, 'workmem'):
                 self.algo = self.workmem
             else:
-                self.algo = config.dnn.conv.algo_bwd
+                self.algo = config.dnn.conv.algo_bwd_data
         if not hasattr(self, 'inplace'):
             self.inplace = False
 
@@ -936,7 +836,11 @@ class GpuDnnConvGradI(DnnBase, COp):
             elif self.algo == 'deterministic':
                 alg = 'CUDNN_CONVOLUTION_BWD_DATA_ALGO_1'
             elif self.algo == 'fft':
+                # need v3, big workspace
                 alg = 'CUDNN_CONVOLUTION_BWD_DATA_ALGO_FFT'
+            elif self.algo == 'fft_tiling':
+                # need v4, big workspace, but less then fft
+                alg = 'CUDNN_CONVOLUTION_BWD_DATA_ALGO_FFT_TILING'
             elif self.algo in ['guess_once', 'guess_on_shape_change']:
                 # The convolution implementation should be chosen according
                 # to a heuristic
@@ -998,7 +902,7 @@ class GpuDnnConv3dGradI(GpuDnnConvGradI):
     :param algo: ['none', 'guess_once', 'guess_on_shape_change',
                   'time_once', 'time_on_shape_change']
 
-        Default is the value of :attr:`config.dnn.conv.algo_bwd`.
+        Default is the value of :attr:`config.dnn.conv.algo_bwd_data`.
 
     """
     __props__ = ('algo', 'inplace',)
@@ -1055,7 +959,8 @@ class GpuDnnConv3dGradI(GpuDnnConvGradI):
 
 
 def dnn_conv(img, kerns, border_mode='valid', subsample=(1, 1),
-             conv_mode='conv', direction_hint=None, workmem=None, algo=None):
+             conv_mode='conv', direction_hint=None, workmem=None, algo=None,
+             precision=None):
     """
     GPU convolution using cuDNN from NVIDIA.
 
@@ -1069,7 +974,7 @@ def dnn_conv(img, kerns, border_mode='valid', subsample=(1, 1),
     kerns
         Convolution filters.
     border_mode
-        One of 'valid', 'full'; additionally, the padding size can be
+        One of 'valid', 'full', 'half'; additionally, the padding size can be
         directly specified by an integer or a pair of integers (as a tuple),
         specifying the amount of zero padding added to _both_ the top and
         bottom (first entry) and left and right (second entry) sides of
@@ -1090,12 +995,26 @@ def dnn_conv(img, kerns, border_mode='valid', subsample=(1, 1),
         removed at any time without a deprecation period. You have been warned.
     workmem
         *deprecated*, use parameter algo instead.
-        algo : {'none', 'small', 'large', 'fft', 'guess_once', 'guess_on_shape_change', 'time_once', 'time_on_shape_change'}
+    algo : {'none', 'small', 'large', 'fft', 'guess_once', 'guess_on_shape_change', 'time_once', 'time_on_shape_change'}
         Convolution implementation to use. Some of its  values may require certain
         versions of CuDNN to be installed. Default is the value of
         :attr:`config.dnn.conv.algo_fwd`.
+    precision : {'as_input', 'float16', 'float32', 'float64'}
+        Description of the dtype in which the computation of the convolution
+        should be done. Possible values are 'as_input', 'float16', 'float32'
+        and 'float64'. Default is the value of
+        :attr:`config.dnn.conv.precision`.
 
     """
+    # For consistence, when using direction_hint too.
+    if border_mode == (0, 0):
+        border_mode = 'valid'
+
+    # Establish dtype in which to perform the computation of the convolution
+    if precision is None:
+        precision = theano.config.dnn.conv.precision
+    if precision == 'as_input':
+        precision = theano.scalar.upcast(img.dtype, kerns.dtype)
 
     # Check if deprecated param 'workmem' is used
     if workmem is not None:
@@ -1123,7 +1042,8 @@ def dnn_conv(img, kerns, border_mode='valid', subsample=(1, 1),
         out = gpu_alloc_empty(shape_i(kerns, 1, fgraph),
                               shape_i(img, 1, fgraph), shape2, shape3)
         desc = GpuDnnConvDesc(border_mode='valid', subsample=(1, 1),
-                              conv_mode='cross')(img.shape, out.shape)
+                              conv_mode='cross', precision=precision)(img.shape,
+                                                                      out.shape)
         conv = GpuDnnConvGradW()(img, kerns, out, desc)
         return as_cuda_ndarray_variable(conv.dimshuffle(1, 0, 2, 3))
 
@@ -1139,7 +1059,8 @@ def dnn_conv(img, kerns, border_mode='valid', subsample=(1, 1),
         out = gpu_alloc_empty(shape_i(img, 0, fgraph),
                               shape_i(kerns, 1, fgraph), shape2, shape3)
         desc = GpuDnnConvDesc(border_mode='valid', subsample=(1, 1),
-                              conv_mode=conv_mode)(out.shape, kerns.shape)
+                              conv_mode=conv_mode, precision=precision)(out.shape,
+                                                                        kerns.shape)
         return GpuDnnConvGradI()(kerns, img, out, desc)
 
     # Standard case: We use GpuDnnConv with suitable padding.
@@ -1148,7 +1069,8 @@ def dnn_conv(img, kerns, border_mode='valid', subsample=(1, 1),
     img = gpu_contiguous(img)
     kerns = gpu_contiguous(kerns)
     desc = GpuDnnConvDesc(border_mode=border_mode, subsample=subsample,
-                          conv_mode=conv_mode)(img.shape, kerns.shape)
+                          conv_mode=conv_mode, precision=precision)(img.shape,
+                                                                    kerns.shape)
     desc_op = desc.owner.op
     out_shp = GpuDnnConv.get_out_shape(img.shape, kerns.shape,
                                        desc_op.border_mode,
@@ -1159,7 +1081,7 @@ def dnn_conv(img, kerns, border_mode='valid', subsample=(1, 1),
 
 def dnn_conv3d(img, kerns, border_mode='valid', subsample=(1, 1, 1),
                conv_mode='conv', direction_hint=None, workmem=None,
-               algo='none'):
+               algo='none', precision=None):
     """
     GPU convolution using cuDNN from NVIDIA.
 
@@ -1168,11 +1090,11 @@ def dnn_conv3d(img, kerns, border_mode='valid', subsample=(1, 1, 1),
 
     :param img: images to do the convolution over
     :param kerns: convolution filters
-    :param border_mode: One of 'valid', 'full'; additionally, the padding
-        size can be directly specified by an integer or a pair of integers
-        (as a tuple), specifying the amount of zero padding added to _both_
-        the top and bottom (first entry) and left and right (second entry)
-        sides of the image.
+    :param border_mode: One of 'valid', 'full', 'half'; additionally, the
+        padding size can be directly specified by an integer or a triplet of
+        integers (as a tuple), specifying the amount of zero padding added to
+        _both_ the top and bottom (first entry) and left and right (second
+        entry) and front and back (third entry) sides of the volume.
     :param subsample: perform subsampling of the output (default: (1, 1, 1))
     :param conv_mode: perform convolution (kernels flipped) or
         cross-correlation. One of 'conv', 'cross'. (default: 'conv')
@@ -1186,6 +1108,10 @@ def dnn_conv3d(img, kerns, border_mode='valid', subsample=(1, 1, 1),
     :param algo: convolution implementation to use. Only 'none' is implemented
         for the conv3d. Default is the value of
         :attr:`config.dnn.conv.algo_fwd`.
+    :param precision : dtype in which the computation of the convolution
+        should be done. Possible values are 'as_input', 'float16', 'float32'
+        and 'float64'. Default is the value of
+        :attr:`config.dnn.conv.precision`.
 
     :warning: The cuDNN library only works with GPU that have a compute
       capability of 3.0 or higer.  This means that older GPU will not
@@ -1193,6 +1119,14 @@ def dnn_conv3d(img, kerns, border_mode='valid', subsample=(1, 1, 1),
     :warning: dnn_conv3d only works with cuDNN library 3.0
 
     """
+    if border_mode == (0, 0):
+        border_mode = 'valid'
+
+    # Establish dtype in which to perform the computation of the convolution
+    if precision is None:
+        precision = theano.config.dnn.conv.precision
+    if precision == 'as_input':
+        precision = theano.scalar.upcast(img.dtype, kerns.dtype)
 
     # Check if deprecated param 'workmem' is used
     if workmem is not None:
@@ -1221,7 +1155,8 @@ def dnn_conv3d(img, kerns, border_mode='valid', subsample=(1, 1, 1),
         out = gpu_alloc_empty(shape_i(kerns, 1, fgraph),
                               shape_i(img, 1, fgraph), shape2, shape3, shape4)
         desc = GpuDnnConvDesc(border_mode='valid', subsample=(1, 1, 1),
-                              conv_mode='cross')(img.shape, out.shape)
+                              conv_mode='cross', precision=precision)(img.shape,
+                                                                      out.shape)
         conv = GpuDnnConv3dGradW()(img, kerns, out, desc)
         return as_cuda_ndarray_variable(conv.dimshuffle(1, 0, 2, 3, 4))
 
@@ -1231,7 +1166,8 @@ def dnn_conv3d(img, kerns, border_mode='valid', subsample=(1, 1, 1),
     img = gpu_contiguous(img)
     kerns = gpu_contiguous(kerns)
     desc = GpuDnnConvDesc(border_mode=border_mode, subsample=subsample,
-                          conv_mode=conv_mode)(img.shape, kerns.shape)
+                          conv_mode=conv_mode, precision=precision)(img.shape,
+                                                                    kerns.shape)
     desc_op = desc.owner.op
     out_shp = GpuDnnConv3d.get_out_shape(img.shape, kerns.shape,
                                          desc_op.border_mode,
@@ -1347,6 +1283,10 @@ class GpuDnnPoolDesc(GpuOp):
             raise RuntimeError("CuDNN pooling with padding requires CuDNN v2")
         if self.get_ndim() == 3 and version() < (3000, 3000):
             raise RuntimeError("CuDNN 3d pooling requires CuDNN v3")
+        if (mode == 'average_exc_pad' and max(pad) > 0 and
+                version() < (4004, 4004)):
+            raise RuntimeError(
+                "CuDNN pooling mode 'average_exc_pad' requires at least v4")
 
     def get_ndim(self):
         return len(self.ws)
@@ -2245,11 +2185,11 @@ if True:
             return [dnn_pool(gpu_contiguous(img), ds, ds)]
 
     @register_opt('cudnn')
-    @local_optimizer([DownsampleFactorMax])
+    @local_optimizer([Pool])
     def local_pool_dnn_alternative(node):
         if not dnn_available():
             return
-        if isinstance(node.op, DownsampleFactorMax):
+        if isinstance(node.op, Pool):
             if not node.op.ignore_border:
                 return
             img, = node.inputs
@@ -2342,11 +2282,12 @@ if True:
             return [out]
 
     @register_opt('cudnn')
-    @local_optimizer([GpuElemwise])
+    @local_optimizer([GpuElemwise, LogSoftmax])
     def local_log_softmax_dnn(node):
         # The log-softmax implementation is only available starting at CuDNN V3
         if not dnn_available() or version() < (3000, 3000):
             return
+
         if (isinstance(node.op, GpuElemwise) and
                 isinstance(node.op.scalar_op, Log) and
                 node.inputs[0].owner and
@@ -2360,6 +2301,21 @@ if True:
                                              'log', softmax_node.op.mode)
             new_log_softmax = new_softmax_node(softmax_node.inputs[0])
             return [new_log_softmax]
+
+        elif (isinstance(node.op, LogSoftmax) and node.inputs[0].owner and
+              isinstance(node.inputs[0].owner.op, HostFromGpu)):
+            if not dnn_available():
+                return
+
+            # Transform the input in the format expected by GpuDnnSoftmax
+            inp = node.inputs[0].owner.inputs[0]
+            if inp.ndim != 2:
+                return
+            inp = inp.dimshuffle(0, 1, 'x', 'x')
+
+            # Apply GpuDnnSoftmax and return the result
+            out = GpuDnnSoftmax('bc01', 'log', 'channel')(gpu_contiguous(inp))
+            return [out.dimshuffle(0, 1)]
 
     class NoCuDNNRaise(Optimizer):
         def apply(self, fgraph):
@@ -2406,13 +2362,13 @@ if True:
 @local_optimizer([AbstractConv2d, AbstractConv2d_gradWeights,
                   AbstractConv2d_gradInputs])
 def local_abstractconv_cudnn(node):
-    inp1 = node.inputs[0]
-    inp2 = node.inputs[1]
-
     if (not isinstance(node.op, (AbstractConv2d,
                                  AbstractConv2d_gradWeights,
                                  AbstractConv2d_gradInputs))):
         return None
+
+    inp1 = node.inputs[0]
+    inp2 = node.inputs[1]
 
     if (not isinstance(inp1.type, CudaNdarrayType) or
             not isinstance(inp2.type, CudaNdarrayType)):

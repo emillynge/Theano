@@ -86,7 +86,7 @@ class BaseCorrMM(gof.Op):
 
     def c_code_cache_version(self):
         # raise this whenever modifying any of the support_code_files
-        return (1, 0)
+        return (1, 1)
 
     def c_support_code_apply(self, node, nodename):
         # REMEMBER TO RAISE c_code_cache_version when changing any of
@@ -179,13 +179,13 @@ class BaseCorrMM(gof.Op):
                 raise ValueError("height must be given for backprop with vertical sampling or border_mode='half'")
             height = '(*(npy_int*)(PyArray_DATA(%s)))' % height
         else:
-            height = 'NULL'
+            height = '-1'
         if ((direction != 0) and (dW != 1)) or ((direction == 1) and (padW == -1)):
             if not width:
                 raise ValueError("width must be given for backprop with horizontal sampling or border_mode='half'")
             width = '(*(npy_int*)(PyArray_DATA(%s)))' % width
         else:
-            width = 'NULL'
+            width = '-1'
         sub = sub.copy()
         sub.update(locals())
 

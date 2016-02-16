@@ -250,16 +250,10 @@ class T_Scan(unittest.TestCase):
             tmpdir = mkdtemp()
             os.chdir(tmpdir)
 
-            f_out = open('tmp_scan_test_pickle.pkl', 'wb')
-            try:
+            with open('tmp_scan_test_pickle.pkl', 'wb') as f_out:
                 pickle.dump(_my_f, f_out, protocol=-1)
-            finally:
-                f_out.close()
-            f_in = open('tmp_scan_test_pickle.pkl', 'rb')
-            try:
+            with open('tmp_scan_test_pickle.pkl', 'rb') as f_in:
                 my_f = pickle.load(f_in)
-            finally:
-                f_in.close()
         finally:
             # Get back to the original dir, and delete the temporary one.
             os.chdir(origdir)
@@ -903,9 +897,9 @@ class T_Scan(unittest.TestCase):
         u0 = theano.tensor.vector('u0')
         u1 = theano.tensor.vector('u1')
         u2 = theano.tensor.vector('u2')
-        mu0 = theano.Param(u0, mutable=False)
-        mu1 = theano.Param(u1, mutable=True)
-        mu2 = theano.Param(u2, mutable=True)
+        mu0 = theano.In(u0, mutable=False)
+        mu1 = theano.In(u1, mutable=True)
+        mu2 = theano.In(u2, mutable=True)
         x0 = theano.tensor.scalar('x0')
         x1 = theano.tensor.scalar('y0')
         W_in = theano.shared(vW_in, 'Win')
@@ -967,9 +961,9 @@ class T_Scan(unittest.TestCase):
         u0 = theano.tensor.vector('u0')
         u1 = theano.tensor.vector('u1')
         u2 = theano.tensor.vector('u2')
-        mu0 = theano.Param(u0, mutable=True)
-        mu1 = theano.Param(u1, mutable=True)
-        mu2 = theano.Param(u2, mutable=True)
+        mu0 = theano.In(u0, mutable=True)
+        mu1 = theano.In(u1, mutable=True)
+        mu2 = theano.In(u2, mutable=True)
         x0 = theano.tensor.scalar('x0')
         x1 = theano.tensor.scalar('y0')
         W_in = theano.shared(vW_in, 'Win')

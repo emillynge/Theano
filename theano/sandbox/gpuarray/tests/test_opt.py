@@ -32,7 +32,7 @@ def test_local_remove_all_assert():
     a = theano.tensor.opt.assert_op(x, theano.tensor.eq(x, 0).any())
 
     # By default `unsafe` should not be there
-    f = theano.function([x], a, mode=mode_with_gpu)
+    f = theano.function([x], a, mode=mode_with_gpu.excluding('unsafe'))
     topo = f.maker.fgraph.toposort()
     a_op = [n for n in topo if isinstance(n.op, theano.tensor.opt.Assert)]
     assert len(a_op) == 1
@@ -124,6 +124,14 @@ def test_local_gpualloc_memset_0():
     z = numpy.zeros((1,), dtype='float32')
     o = numpy.ones((1,), dtype='float32')
     ones = numpy.ones((2,), dtype='float32')
+
+    # Test with 0 from CPU op.
+    a = tensor.alloc(z, i)
+    f = theano.function([i], a, mode=mode_with_gpu)
+    topo = f.maker.fgraph.toposort()
+    assert len(topo) == 2
+    assert isinstance(topo[0].op, GpuAlloc) and topo[0].op.memset_0
+    assert (numpy.asarray(f(6)) == 0).all()
 
     # Test with 0
     a = GpuAlloc(test_ctx_name)(z, i)
@@ -356,3 +364,16 @@ def test_local_gpu_elemwise():
     out = f(a_v, b_v)
     utt.assert_allclose(out[0], a_v[::2] + b_v[::2])
     utt.assert_allclose(out[1], a_v[::2] * c_v[::2])
+
+
+def test_local_lift_abstractconv_gpu_shape():
+    prev = theano.config.on_opt_error
+    try:
+        theano.config.on_opt_error = 'raise'
+        s = tensor.ivector()
+        a = tensor.ftensor4()
+        b = tensor.ftensor4()
+        c = tensor.nnet.abstract_conv.AbstractConv2d_gradWeights()(a, b, s)
+        theano.function([s, a, b], c, mode=mode_with_gpu)
+    finally:
+        theano.config.on_opt_error = prev
