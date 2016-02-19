@@ -6588,7 +6588,7 @@ class test_arithmetic_cast(unittest.TestCase):
 
 class T_long_tensor(unittest.TestCase):
     def test_fit_int64(self):
-        for exp in xrange(64):
+        for exp in xrange(gof.python_int_bitwidth()):
             val = L(2 ** exp - 1)
             scalar_ct = constant(val)
             assert scalar_ct.dtype.startswith('int')

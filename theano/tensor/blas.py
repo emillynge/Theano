@@ -306,6 +306,14 @@ SOMEPATH/Canopy_64bit/User/lib/python2.7/site-packages/numpy/distutils/system_in
         if res:
             return res
 
+        # Some environment don't have the lib dir in LD_LIBRARY_PATH.
+        # So add it.
+        ret.extend(['-Wl,-rpath,' + l for l in
+                    blas_info.get('library_dirs', [])])
+        res = try_blas_flag(ret)
+        if res:
+            return res
+
         # Try to add the anaconda lib directory to runtime loading of lib.
         # This fix some case with Anaconda 2.3 on Linux.
         # Newer Anaconda still have this problem but only have
@@ -431,14 +439,6 @@ class Gemv(Op):
             raise TypeError('gemv requires vector for x', x.type)
         if y.ndim != 1:
             raise TypeError('gemv requires vector for y', y.type)
-        if y.broadcastable[0] != A.broadcastable[0]:
-            raise TypeError('broadcastable mismatch between y and A',
-                            (y.type, A.type))
-        # The following is not grounds for error because as long as
-        # sizes are 1 at time of perform() there is no problem
-        # if x.broadcastable[0] != A.broadcastable[1]:
-        # raise TypeError('broadcastable mismatch between x and A',
-        # (x.type, A.type))
         return Apply(self, [y, alpha, A, x, beta], [y.type()])
 
     def perform(self, node, inputs, out_storage):
@@ -472,6 +472,9 @@ class Gemv(Op):
             else:
                 out += y
             out_storage[0][0] = numpy.asarray(out, dtype=y.dtype)
+
+    def infer_shape(self, node, input_shapes):
+        return [input_shapes[0]]
 
 gemv_no_inplace = Gemv(inplace=False)
 gemv_inplace = Gemv(inplace=True)
@@ -539,6 +542,9 @@ class Ger(Op):
         else:
             A += numpy.outer(cx, cy)
         cZ[0] = A
+
+    def infer_shape(self, node, input_shapes):
+        return [input_shapes[0]]
 
 
 ger = Ger(destructive=False)
@@ -1001,6 +1007,8 @@ class Gemm(GemmRelated):
     E_mixed = 'gemm requires matching dtypes'
     E_float = 'gemm requires floating-point dtypes'
 
+    __props__ = ('inplace',)
+
     def __init__(self, inplace):
         self.inplace = inplace
         if self.inplace:
@@ -1008,13 +1016,6 @@ class Gemm(GemmRelated):
             self.setup_z_Nz_Sz = self.setup_z_Nz_Sz_inplace
         else:
             self.setup_z_Nz_Sz = self.setup_z_Nz_Sz_outplace
-
-    def __eq__(self, other):
-        return (type(self) == type(other) and
-                self.inplace == other.inplace)
-
-    def __hash__(self):
-        return hash(type(self)) ^ hash(self.inplace)
 
     def __str__(self):
         if self.inplace:
@@ -1123,6 +1124,9 @@ class Gemm(GemmRelated):
                 z *= b
                 z += a * numpy.dot(x, y)
             zout[0] = z
+
+    def infer_shape(self, node, input_shapes):
+        return [input_shapes[0]]
 
     setup_z_Nz_Sz_inplace = """
         if (%(_zout)s != %(_z)s)
@@ -1747,8 +1751,8 @@ class Dot22(GemmRelated):
             e.args = e.args + (x.shape, y.shape)
             raise
 
-    def __str__(self):
-        return self.__class__.__name__
+    def infer_shape(self, node, input_shapes):
+        return [[input_shapes[0][0], input_shapes[1][1]]]
 
     setup_z_Nz_Sz = """
         if ((NULL == %(_zout)s)
@@ -2018,8 +2022,8 @@ class Dot22Scalar(GemmRelated):
             e.args = e.args + (x.shape, y.shape)
             raise
 
-    def __str__(self):
-        return self.__class__.__name__
+    def infer_shape(self, node, input_shapes):
+        return [[input_shapes[0][0], input_shapes[1][1]]]
 
     setup_z_Nz_Sz = Dot22.setup_z_Nz_Sz
 
