@@ -39,6 +39,16 @@ class TestCusolver(unittest.TestCase):
         x_res = numpy.array(res[0])
         utt.assert_allclose(x_res, x_val)
 
+    def run_gpu_chol_factor(self, A_val):
+        A = theano.tensor.matrix("A", dtype="float32")
+        from scipy.linalg import cholesky
+        solver = cusolver.gpu_chol_factor(A)
+        fn = theano.function([A], [solver])
+        res = fn(A_val)
+        R_res = numpy.array(res[0])
+        A_res = R_res @ R_res.T
+        utt.assert_allclose(A_val, A_res)
+
     def test_diag_solve(self):
         numpy.random.seed(1)
         A_val = numpy.asarray([[2, 0, 0], [0, 1, 0], [0, 0, 1]],
@@ -69,3 +79,11 @@ class TestCusolver(unittest.TestCase):
         x_val = numpy.random.uniform(-0.4, 0.4,
                                      (A_val.shape[1], 4)).astype("float32")
         self.run_gpu_solve(A_val, x_val)
+
+    def test_sym_chol_factor(self):
+        numpy.random.seed(1)
+        A_val = numpy.random.uniform(-0.4, 0.4, (5, 5)).astype("float32")
+        A_sym =((A_val + A_val.T)  + numpy.eye(5) * 5).astype("float32")
+
+
+        self.run_gpu_chol_factor(A_sym)

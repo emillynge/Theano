@@ -1,5 +1,6 @@
 from __future__ import absolute_import, division, print_function
 
+import numpy
 import pkg_resources
 import theano
 
@@ -19,13 +20,13 @@ except ImportError:
 cusolver_available = False
 
 try:
-    from scikits.cuda import cusolver
+    from scikits.cuda import cusolver, cublas, linalg, misc
     cusolver_available = True
 except (ImportError, OSError, RuntimeError, pkg_resources.DistributionNotFound):
     pass
 
 cusolver_handle = None
-
+cublas_handle = None
 
 class GpuCusolverSolve(GpuOp):
     """
@@ -160,3 +161,117 @@ class GpuCusolverSolve(GpuOp):
         return thunk
 
 gpu_solve = GpuCusolverSolve()
+
+class GpuCusolverCholFactor(GpuOp):
+    """
+    CUSOLVER GPU solver OP.
+
+    Parameters
+    ----------
+    trans
+        Whether to take the transpose of the input matrix or not.
+
+    """
+
+    __props__ = ('uplo',)
+
+    def __init__(self, uplo='U'):
+        self.uplo = uplo
+        super(GpuCusolverCholFactor, self).__init__()
+
+    def make_node(self, inp1):
+        inp1 = as_cuda_ndarray_variable(inp1)
+
+        assert inp1.ndim == 2
+        return theano.Apply(
+            self, [inp1],
+            [CudaNdarrayType(broadcastable=[False] * inp1.type.ndim)()])
+
+    def make_thunk(self,
+                   node,
+                   storage_map, _,
+                   no_recycling=[]):
+        if not cusolver_available:
+            raise RuntimeError('CUSOLVER is not available and '
+                               'GpuCusolverSolve Op can not be constructed.')
+
+        inputs = [storage_map[v] for v in node.inputs]
+        outputs = [storage_map[v] for v in node.outputs]
+
+        def thunk():
+            global cusolver_handle
+            global cublas_handle
+
+            # Size of the matrices to invert.
+            z = outputs[0]
+
+            # Matrix.
+            A = inputs[0][0]
+
+            # A is not explicitly converted between C and F order, instead we
+            # switch the "transpose" flag.
+
+            if self.uplo in ('U', 'u'):
+                uplo = 1
+            else:
+                uplo = 0
+
+            # This copy forces allocation of a new C-contiguous buffer
+            # and returns it.
+            A_cpy = A.copy()
+
+            assert(len(A.shape) == 2)
+
+            n, l = A.shape
+            lda = max(1, n)
+
+
+            A_ptr = A_cpy.gpudata
+
+            if cusolver_handle is None:
+                cusolver_handle = cusolver.cusolverDnCreate()
+
+            if cublas_handle is None:
+                cublas_handle = cublas.cublasCreate()
+
+            workspace_size = cusolver.cusolverDnSpotrf_bufferSize(
+                cusolver_handle, uplo, n, int(A_ptr), lda)
+
+            if (thunk.workspace is None or
+                        thunk.workspace.size != workspace_size):
+                thunk.workspace = CudaNdarray.zeros((workspace_size,))
+
+            if thunk.dev_info is None:
+                thunk.dev_info = CudaNdarray.zeros((1,))
+
+            workspace_ptr = thunk.workspace.gpudata
+            dev_info_ptr = thunk.dev_info.gpudata
+
+            cusolver.cusolverDnSpotrf(
+                cusolver_handle, uplo, n, int(A_ptr), lda, int(workspace_ptr),
+                workspace_size, int(dev_info_ptr))
+
+            N = A_cpy.shape[0]
+
+            # Get block/grid sizes:
+            dev = misc.get_current_device()
+            block_dim, grid_dim = misc.select_block_grid_sizes(dev, A_cpy.shape)
+            tri = linalg._get_triu_kernel(0, 0, cols=N) if not uplo else linalg._get_tril_kernel(0, 0, cols=N)
+            tri(A_cpy, numpy.uint32(A_cpy.size),
+                 block=block_dim,
+                 grid=grid_dim)
+
+
+            z[0] = A_cpy
+
+        thunk.inputs = inputs
+        thunk.outputs = outputs
+        thunk.lazy = False
+
+        thunk.workspace = None
+        thunk.pivots = None
+        thunk.dev_info = None
+
+        return thunk
+
+gpu_chol_factor = GpuCusolverCholFactor()
