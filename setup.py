@@ -56,7 +56,7 @@ MICRO               = 0
 SUFFIX              = "dev4"  # Should be blank except for rc's, betas, etc.
 ISRELEASED          = False
 
-VERSION             = '%d.%d.%d%s' % (MAJOR, MINOR, MICRO, SUFFIX)
+VERSION             = "9.0" #'%d.%d.%d%s' % (MAJOR, MINOR, MICRO, SUFFIX)
 
 
 def find_packages(where='.', exclude=()):
